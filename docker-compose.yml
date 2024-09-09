@@ -1,0 +1,8 @@
+version: '3.4'
+
+services:
+  cs61f24psets:
+    image: cs61f24psets
+    build:
+      context: .
+      dockerfile: ./Dockerfile

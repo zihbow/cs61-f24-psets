@@ -16,7 +16,6 @@ int main() {
     assert((uintptr_t) ptr2 % alignof(double) == 0);
     assert((uintptr_t) ptr2 % alignof(unsigned long long) == 0);
     assert((uintptr_t) ptr2 % alignof(std::max_align_t) == 0);
-
     m61_free(ptr);
     m61_free(ptr2);
 }

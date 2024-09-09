@@ -3,13 +3,12 @@ Author and collaborators
 
 Student
 -------
-(Your name.)
+Zihongbo Wang
 
 
 Collaborators
 -------------
-(List any other collaborators and describe help you got from other students
-in the class.)
+Rowan Wang - Helped me figure out how to open the github repository lol
 
 
 Citations
