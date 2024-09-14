@@ -18,6 +18,10 @@ struct m61_memory_buffer {
     m61_memory_buffer();
     ~m61_memory_buffer();
 };
+struct allocinfo{ //create a map from each pointer to the size and position of the memory it represents
+    size_t sz;
+    size_t pos;
+};
 
 static m61_memory_buffer default_buffer;
 static unsigned long long ntotal = 0;
@@ -25,9 +29,12 @@ static unsigned long long nactive = 0;
 static unsigned long long total_size = 0;
 static unsigned long long nfail = 0;
 static unsigned long long fail_size = 0;
-static uintptr_t heap_min = SIZE_MAX;
-static uintptr_t heap_max = 0;
-static std::map<void*, size_t> mp;
+static unsigned long long active_size = 0;
+static uintptr_t heap_min = SIZE_MAX; // heap_min will only decrease with updates, so we initialize it using an arbitrarily large value
+static uintptr_t heap_max = 0; // heap_max will only increase with updates, so we initialize it using an arbitrarily large value
+static std::map<void*, allocinfo> mp;
+static std::vector<void*> activeptrs;
+
 
 m61_memory_buffer::m61_memory_buffer() {
     void* buf = mmap(nullptr,    // Place the buffer at a random address
@@ -43,7 +50,16 @@ m61_memory_buffer::~m61_memory_buffer() {
     munmap(this->buffer, this->size);
 }
 
-
+void resize() { //shift all of the allocations down in order to ensure that we don't have needless gaps in our memory allocation
+    size_t temp = 0;
+    for (auto& pair : mp) {
+        pair.second.pos = temp; //
+        size_t aligned_sz = pair.second.sz + (16 - (pair.second.sz % 16)) % 16;
+        temp += aligned_sz; //update temp to track used size, so the pointer is always at the next available memory allocation position
+    }
+    heap_max = temp; //update heap_max to the new end of the heap
+    default_buffer.pos = heap_max;
+}
 
 /// m61_malloc(sz, file, line)
 ///    Returns a pointer to `sz` bytes of freshly-allocated dynamic memory.
@@ -54,32 +70,40 @@ m61_memory_buffer::~m61_memory_buffer() {
 void* m61_malloc(size_t sz, const char* file, int line) {
     (void) file, (void) line;   // avoid uninitialized variable warnings
     // Your code here.
-    
+    if(sz > default_buffer.size - default_buffer.pos) { //only resize when we can't fit something
+    resize(); 
+}
 
-    
-    
-    if (sz > default_buffer.size - default_buffer.pos) {
+    if (sz > default_buffer.size - heap_max) { //if resizing still doesn't fit it, then return the nullptr
         // Not enough space left in default buffer for allocation
-        ++nfail;
-        fail_size = fail_size + sz;
-
+        // The rearrangement of the inequality ensures that default_buffer.size - default_buffer.pos never overflows, because default_buff.pos < default_buffer.size by construction.
+        ++nfail; // Increase the fail counter by 2
+        fail_size = fail_size + sz; // Increase the fail size by the size of the failed allocation
         return nullptr;
     }
-    ++ntotal;
-    ++nactive;
-    total_size = total_size + sz;
-    size_t aligned_sz = sz + (16 - (sz % 16)) % 16;
-    // Otherwise there is enough space; claim the next `sz` bytes
-    void* ptr = &default_buffer.buffer[default_buffer.pos];
-    uintptr_t ptr_as_uint = (uintptr_t) ptr;
-    default_buffer.pos += aligned_sz;
 
+    ++ntotal; // If the allocated memory fits, then add one to the total number of memory allocations
+    ++nactive; // Add one to the number of active allocations
+    total_size = total_size + sz; // Add the size of the allocation to the total size allocation (not just active)
+    active_size = active_size + sz;
+    size_t aligned_sz = sz + (16 - (sz % 16)) % 16; // Adjusted sizing to ensure that the default_buffer.pos is always a multiple of 16 by rounding sz up to the nearest power of 16. 
+
+    // Otherwise there is enough space; claim the next `sz` bytes
+
+    void* ptr = &default_buffer.buffer[default_buffer.pos];
+    mp[ptr] = {sz, default_buffer.pos};
+
+    uintptr_t ptr_as_uint = (uintptr_t) ptr; // Cast ptr as an unsigned int pointer in order to compare it to heap_min/max
     if(ptr_as_uint < heap_min){
-        heap_min = ptr_as_uint;
+        heap_min = ptr_as_uint; // update heap_min using ptr: if it is less than our heap_min value, then we want to replace it with the smaller pointer.
     }
     if(ptr_as_uint + sz > heap_max){
-        heap_max = sz + ptr_as_uint;
+        heap_max = sz + ptr_as_uint; // We are interested in the last address of a pointer, so we have to update it every time we allocate memory such that the end of the memory is larger than the current heap_max
     }
+    default_buffer.pos += aligned_sz; // Use the aligned size to update the buffer position
+    
+
+    
 
     
     return ptr;
@@ -96,7 +120,10 @@ void m61_free(void* ptr, const char* file, int line) {
     // avoid uninitialized variable warnings
     (void) ptr, (void) file, (void) line;
     if(ptr != nullptr){
-    --nactive;
+    --nactive; //decrement number of active allocations by one
+    active_size = active_size - mp[ptr].sz; // keep track of the active size
+    mp.erase(ptr); //get rid of the ptr in our map, effectively deleting it. now when we iterate through the map, it's simply all of the active allocations
+
     }
     
     // Your code here. The handout code does nothing!
@@ -115,12 +142,12 @@ void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
     if(count == 0){
         return m61_malloc(0);
     }
-    if((default_buffer.size - default_buffer.pos) / count < sz){
-        ++nfail;
-        fail_size = fail_size + count * sz;
+    if((default_buffer.size - default_buffer.pos) / count < sz){ // Since sz * count could overflow, we divide by count instead to ensure that our comparisons are accurate. 
+        ++nfail; 
+        fail_size = fail_size + count * sz; // The total memory allocated would be the size of any element multiplied by the number of elements in the array. 
         return nullptr;
     }
-    void* ptr = m61_malloc(count * sz, file, line);
+    void* ptr = m61_malloc(count * sz, file, line); //calloc is just malloc count times
     if (ptr) {
         memset(ptr, 0, count * sz);
     }
@@ -135,8 +162,9 @@ m61_statistics m61_get_statistics() {
     
     // The handout code sets all statistics to enormous numbers.
     m61_statistics stats;
-    memset(&stats, 0, sizeof(m61_statistics));
+    memset(&stats, 0, sizeof(m61_statistics)); // We initialize all to zero
 
+    // Update all of the values of the statistics based on our updates throughout the code
     stats.ntotal = ntotal;
     stats.nactive = nactive;
     stats.total_size = total_size;
@@ -144,6 +172,7 @@ m61_statistics m61_get_statistics() {
     stats.fail_size = fail_size;
     stats.heap_max = heap_max;
     stats.heap_min = heap_min;
+    stats.active_size = active_size;
     return stats;
 }
 
