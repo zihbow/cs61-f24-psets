@@ -54,10 +54,10 @@ void resize() { //shift all of the allocations down in order to ensure that we d
     size_t temp = 0;
     for (auto& pair : mp) {
         pair.second.pos = temp; //
-        size_t aligned_sz = pair.second.sz + (16 - (pair.second.sz % 16)) % 16;
-        temp += aligned_sz; //update temp to track used size, so the pointer is always at the next available memory allocation position
+        temp += pair.second.sz; //update temp to track used size, so the pointer is always at the next available memory allocation position
     }
     heap_max = temp; //update heap_max to the new end of the heap
+    
     default_buffer.pos = heap_max;
 }
 
@@ -86,7 +86,7 @@ void* m61_malloc(size_t sz, const char* file, int line) {
     ++nactive; // Add one to the number of active allocations
     total_size = total_size + sz; // Add the size of the allocation to the total size allocation (not just active)
     active_size = active_size + sz;
-    size_t aligned_sz = sz + (16 - (sz % 16)) % 16; // Adjusted sizing to ensure that the default_buffer.pos is always a multiple of 16 by rounding sz up to the nearest power of 16. 
+    size_t aligned_sz = sz + (16 - (sz % 16)) % 16; // Adjusted sizing to ensure that the default_buffer.pos is always a multiple of 16 by rounding sz up to the nearest  of 16. 
 
     // Otherwise there is enough space; claim the next `sz` bytes
 
