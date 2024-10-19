@@ -62,13 +62,16 @@ void kernel_start(const char* command) {
 
     // (re-)initialize kernel page table
     for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE) {
-        int perm = PTE_P | PTE_W | PTE_U;
+        int perm = PTE_P | PTE_W;
         if (addr == 0) {
             // nullptr is inaccessible even to the kernel
             perm = 0;
         }
-        else if ((addr < 0x100000) & addr != 0xB8000){
-            perm = PTE_P | PTE_W;
+        else if (addr == CONSOLE_ADDR){
+            perm = PTE_P | PTE_W | PTE_U;
+        }
+        else if (addr >= PROC_START_ADDR) {
+            perm = PTE_P | PTE_W | PTE_U;
         }
         // install identity mapping
         int r = vmiter(kernel_pagetable, addr).try_map(addr, perm);
@@ -155,12 +158,13 @@ void* kalloc(size_t sz) {
 //    If `kptr == nullptr` does nothing.
 
 void kfree(void* kptr) {
+
     if (kptr == nullptr){
         return; //no need to do anything
     }
     uintptr_t pa = (uintptr_t) kptr;
     if (!allocatable_physical_address(pa)) {
-        return; //we need to free something
+        return; // check if pa is allocatable, if not, then simply return
     }
 
     unsigned int pageno = pa / PAGESIZE; //calculate the page number
@@ -179,15 +183,16 @@ void free_pagetable(x86_64_pagetable* pagetable) {
         return;
     }
 
-    for (vmiter it(pagetable, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE) {
+    for (vmiter it(pagetable, PROC_START_ADDR); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE) { //we want to specifically iterate over addresses >= proc_start_addr
         if (it.present() && it.user() && it.va() != CONSOLE_ADDR) {
-        kfree((void*) it.pa()); // go through the pagetable and individually free each mapping
+            kfree((void*) it.pa()); // go through the pagetable and individually free each mapping
         }
     }
     for (ptiter it(pagetable); !it.done(); it.next()) {
     kfree(it.kptr()); //wahoo!!
     }
     kfree(pagetable);
+
 }
 
 // process_setup(pid, program_name)
@@ -243,12 +248,15 @@ void process_setup(pid_t pid, const char* program_name) {
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
         size_t data_index = 0; //pointer to the current seg data
         for (uintptr_t addr = seg.va(); addr < seg.va() + seg.size(); addr += PAGESIZE) {
-            uintptr_t physical_addr = vmiter(ptable[pid].pagetable,addr).pa();
-            memset((void*) physical_addr,0,PAGESIZE);
+            memset((void*) vmiter(ptable[pid].pagetable, addr).pa(),0,PAGESIZE);
+            size_t offset = addr - seg.va();
             
-            if (data_index < seg.data_size()) { //of our pointer goes out of bounds, figure out how much data to copy, and change the offset
+            if (data_index < seg.data_size()) { //if our pointer goes out of bounds, figure out how much data to copy depending on the offset
                 size_t copy_size = PAGESIZE;
-                memcpy((void*) physical_addr, seg.data() + data_index, copy_size); //use memcpy to copy the data from the segment into the physical memory
+                if (offset + copy_size > seg.data_size()) {
+                    copy_size = seg.data_size() - offset;
+                }
+                memcpy((void*) vmiter(ptable[pid].pagetable,addr).pa(), seg.data() + data_index, copy_size); //use memcpy to copy the data from the segment into the physical memory
                 data_index += copy_size; //iterate through the data_index
             }
         }
@@ -262,6 +270,7 @@ void process_setup(pid_t pid, const char* program_name) {
 }
 
 void syscall_exit(int pid) {
+
     x86_64_pagetable* pagetable = ptable[pid].pagetable;
     free_pagetable(pagetable);
 
@@ -434,7 +443,11 @@ int syscall_page_alloc(uintptr_t addr) {
     if (addr ==0 || addr % PAGESIZE  != 0|| addr < PROC_START_ADDR || addr >= MEMSIZE_VIRTUAL) {
         return -1;
     }
-
+    vmiter iter(current->pagetable, addr);
+    if (iter.present()) {
+        uintptr_t pa = iter.pa();
+        kfree((void*) pa);
+    }
     uintptr_t a = (uintptr_t) kalloc(PAGESIZE);
     if (a == 0) {
         return -1;
@@ -492,7 +505,6 @@ int syscall_fork(int parent, regstate parent_regs) {
             }
 
             int r = vmiter(childpagetable, iterparent.va()).try_map((uintptr_t) child_pa, iterparent.perm());
-
             if(r != 0){
                 kfree(child_pa);
                 free_pagetable(childpagetable);
