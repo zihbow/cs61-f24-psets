@@ -67,7 +67,7 @@ extern proc ptable[PID_MAX];
 //    The memory viewer calls `used()` and `valid()` to check for bugs.
 struct physpageinfo {
     uint8_t refcount = 0;
-
+    pid_t owner;
     bool used() const {
         return this->refcount != 0;
     }
