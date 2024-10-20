@@ -126,7 +126,7 @@ void* kalloc(size_t sz) {
     }
 
     int pageno = 0;
-    int page_increment = 7;
+    int page_increment = 1;
     // In the handout code, `kalloc` returns the first free page.
     // Alternate search strategies can be faster and/or expose bugs elsewhere.
     // This initialization returns a random free page:
@@ -169,10 +169,10 @@ void kfree(void* kptr) {
 
     unsigned int pageno = pa / PAGESIZE; //calculate the page number
 
-    if (physpages[pageno].refcount > 0) {
-        --physpages[pageno].refcount;
-    } else {
-        return; // if recount is less than 1, invalid free
+    if (physpages[pageno].refcount == 0) {
+        return;
+    }else {
+        --physpages[pageno].refcount; // if recount is less than 1, invalid free
     }
 
 }
