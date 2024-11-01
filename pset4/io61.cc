@@ -1,6 +1,7 @@
 #include "io61.hh"
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <climits>
 #include <cerrno>
 
@@ -19,6 +20,8 @@ struct io61_file {
     off_t end_tag;
     static constexpr off_t bufsize = 4096; //cache block size
     unsigned char cbuf[bufsize]; //cached data
+    unsigned char* mmap_data = nullptr; // pointer to mapped data
+    off_t mmap_size = 0; // size of mapped data
 };
 
 
@@ -35,6 +38,21 @@ io61_file* io61_fdopen(int fd, int mode) {
     f->tag = 0;
     f->end_tag = 0;
     f->pos_tag = 0;
+
+    //if we are read only, we can set up the mmap
+    if (mode == O_RDONLY) {
+        // Get the file size
+        struct stat s;
+        if (fstat(fd, &s) == 0 && S_ISREG(s.st_mode)) {
+            f->mmap_size = s.st_size;
+            f->mmap_data = (unsigned char*) mmap(nullptr, f->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0); //map when we can
+            if (f->mmap_data == MAP_FAILED) { //if the map fails, set the struct data accordingly
+                f->mmap_data = nullptr;
+                f->mmap_size = 0;
+            }
+        }
+    }
+
     return f;
 }
 
@@ -44,6 +62,9 @@ io61_file* io61_fdopen(int fd, int mode) {
 
 int io61_close(io61_file* f) {
     io61_flush(f);
+    if (f->mmap_data) { //if f->mmap_data is not the nullptr, we can do this
+        munmap(f->mmap_data, f->mmap_size);
+    }
     int r = close(f->fd);
     delete f;
     return r;
@@ -51,13 +72,16 @@ int io61_close(io61_file* f) {
 
 // io61_fill returns -1 on error, otherwise returns non-negative n (n = 0 would imply EOF).
 int io61_fill(io61_file* f) {
+    if (f->mmap_data) {
+        return 0; // no need to fill when using mmap
+    }
 
-    // Check invariants.
+    // check
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
 
     f->tag = f->pos_tag = f->end_tag;
-    // Read data.
+    // read
     ssize_t n = read(f->fd, f->cbuf, f->bufsize);
     if (n >= 0) {
         f->end_tag = f->tag + n;
@@ -65,7 +89,7 @@ int io61_fill(io61_file* f) {
     else{
         return -1;
     }
-    // Recheck invariants (good practice!).
+    // rechecking because section notes told us to
     assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
     assert(f->end_tag - f->pos_tag <= f->bufsize);
     
@@ -89,6 +113,7 @@ int io61_readc(io61_file* f) {
 }
 
 
+
 // io61_read(f, buf, sz)
 //    Reads up to `sz` bytes from `f` into `buf`. Returns the number of
 //    bytes read on success. Returns 0 if end-of-file is encountered before
@@ -96,40 +121,55 @@ int io61_readc(io61_file* f) {
 //    bytes are read.
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    size_t nread = 0;
-    while (nread < sz) {
-        // Check if cache needs refilling
-        if (f->pos_tag >= f->end_tag) {
-            int n = io61_fill(f);
-            if (n == -1) { // if fill fails, figure out if we are at EOF or if another error occurred
-                return -1;
-            }
-            if (n == 0) {
-                break;
-            }
+    if (f->mmap_data) {
+        if (f->pos_tag >= f->mmap_size) {
+            // EOF
+            return 0;
         }
-        assert(f->tag <= f->end_tag);
-        assert(f->pos_tag >= f->tag);
-        //calculate how much we can/need to read from the cache
-
-        size_t bytes_to_copy = f->end_tag - f->pos_tag;
-        if(bytes_to_copy > sz - nread){
-            bytes_to_copy = sz - nread;
+        size_t bytes_available = f->mmap_size - f->pos_tag; //the total number of bytes is the difference between the size of the mmap and the current position
+        size_t bytes_to_copy = sz;
+        if (bytes_to_copy > bytes_available) {
+            bytes_to_copy = bytes_available;
         }
-        // Copy from cache to the output buffer
-
-        memcpy(&buf[nread], &f->cbuf[f->pos_tag - f->tag], bytes_to_copy);
-        // Update position pointer, update the value of nread.
+        memcpy(buf, f->mmap_data + f->pos_tag, bytes_to_copy);
         f->pos_tag += bytes_to_copy;
-        nread += bytes_to_copy;
-    }
+        return bytes_to_copy;
+    } else {
+        size_t nread = 0;
+        while (nread < sz) {
+            // Check if cache needs refilling
+            if (f->pos_tag >= f->end_tag) {
+                int n = io61_fill(f);
+                if (n == -1) { // if fill fails, figure out if we are at EOF or if another error occurred
+                    return -1;
+                }
+                if (n == 0) {
+                    break;
+                }
+            }
+            assert(f->tag <= f->end_tag);
+            assert(f->pos_tag >= f->tag);
+            //calculate how much we can/need to read from the cache
 
-    // Return the number of bytes read, which should be sz 
-    if (nread != 0 || sz == 0 || errno == 0) {
-        return nread;
-    }
-    else {
-        return -1;
+            size_t bytes_to_copy = f->end_tag - f->pos_tag;
+            if(bytes_to_copy > sz - nread){
+                bytes_to_copy = sz - nread;
+            }
+            // Copy from cache to the output buffer
+
+            memcpy(&buf[nread], &f->cbuf[f->pos_tag - f->tag], bytes_to_copy);
+            // Update position pointer, update the value of nread.
+            f->pos_tag += bytes_to_copy;
+            nread += bytes_to_copy;
+        }
+
+        // Return the number of bytes read, which should be sz 
+        if (nread != 0 || sz == 0 || errno == 0) {
+            return nread;
+        }
+        else {
+            return -1;
+        }
     }
 }
 
@@ -139,7 +179,7 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 
 int io61_writec(io61_file* f, int c) {
     unsigned char ch = c;
-    ssize_t nw = io61_write(f, &ch, 1);
+    ssize_t nw = io61_write(f, &ch, 1); //write a single character lol
     if (nw == 1) {
         return 0;
     } else {
@@ -165,7 +205,7 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
             }
         }
         size_t bytes_to_copy = f->tag + f->bufsize - f->pos_tag; //calculate the number of bytes to copy from our cache to buffer
-        if(bytes_to_copy > sz - nwritten){
+        if(bytes_to_copy > sz - nwritten){ //if we can fit sz characters into our cache, then do that!
             bytes_to_copy = sz - nwritten;
         }
 
@@ -188,21 +228,23 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    drop any data cached for reading.
 
 int io61_flush(io61_file* f) {
+    if (f->mode == O_RDONLY) { //if read only, return 0.
+        return 0;
+    }
     off_t nflushed = 0;
     while (f->tag + nflushed < f->end_tag) {
-        ssize_t nw = write(f->fd, f->cbuf + nflushed, f->end_tag - f->tag - nflushed);
-        if (nw < 0) {
-        if (errno == EINTR || errno == EAGAIN) {
+        ssize_t n = write(f->fd, f->cbuf + nflushed, f->end_tag - f->tag - nflushed); //flush!!!
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN) {
                 continue;
             } else {
                 return -1;
             }
         } else {
-            nflushed += nw;
+            nflushed += n; //increment our total number of flushed
         }
     }
-
-    assert(f->tag + nflushed== f->end_tag);
+    assert(f->tag + nflushed == f->end_tag); //we should have flushed the entire cache
     f->tag = f->end_tag;
         
     return 0;
@@ -215,33 +257,40 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
-	assert(f->mode == O_RDONLY || f->mode == O_WRONLY);
-	if(f->mode == O_RDONLY){
-		if (f->tag <= off && off <= f->end_tag) {
-			f->pos_tag = off;
-			return 0;
-		}
-		off_t cache_tag = (off / f->bufsize) * f->bufsize;
-		off_t r = lseek(f->fd, cache_tag, SEEK_SET);
-		if (r == -1) {
-			return -1;
-		}
-		ssize_t nr = read(f->fd, f->cbuf, f->bufsize);
-		f->tag = cache_tag;
-		f->end_tag = cache_tag + nr;
-		f->pos_tag = off;
-	} else {
-		io61_flush(f);
-		off_t r = lseek(f->fd, off, SEEK_SET);
-		if (r == -1) {
-			return -1;
-		}
-		f->tag = r;
-		f->pos_tag = r;
-		f->end_tag = r;
-	}
-	return 0;
+    if (f->mmap_data) {
+        if (off >= 0 && off <= (off_t) f->mmap_size) { //if the offset is within the mmap size, simply change the pos_tag
+            f->pos_tag = off;
+            return 0;
+        }
+        } else {
+        assert(f->mode == O_RDONLY || f->mode == O_WRONLY);
+        if(f->mode == O_RDONLY){
+            if (f->tag <= off && off <= f->end_tag) {
+                f->pos_tag = off;
+            }
+            off_t begincache = (off / f->bufsize) * f->bufsize; //truncate off to align with bufsize
+            off_t r = lseek(f->fd, begincache, SEEK_SET); //set the file pointer to the aligned position
+            if (r == -1) {
+                return -1;
+            }
+            ssize_t n = read(f->fd, f->cbuf, f->bufsize); //set the cache
+            f->tag = begincache;
+            f->end_tag = begincache + n;
+            f->pos_tag = off;
+        } else { //otherwise, if it's write only, flush and set our file point
+            io61_flush(f);
+            off_t r = lseek(f->fd, off, SEEK_SET);
+            if (r == -1) {
+                return -1;
+            }
+            f->tag = r;
+            f->pos_tag = r;
+            f->end_tag = r;
+        }
+    }
+    return 0;
 }
+
 
 
 
