@@ -83,7 +83,12 @@ int io61_readc(io61_file* f) {
     if(n == 1){
         return ch;
     }
+    else if(n == 0){
+        errno = 0; //EOF 
+        return -1;
+    }
     else{
+        assert(n == -1 && errno > 0);
         return -1;
     }
 }
@@ -143,7 +148,7 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 
 int io61_writec(io61_file* f, int c) {
     unsigned char ch = c;
-    ssize_t nw = write(f->fd, &ch, 1);
+    ssize_t nw = io61_write(f, &ch, 1);
     if (nw == 1) {
         return 0;
     } else {
@@ -160,18 +165,38 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    size_t nwritten = 0;
-    while (nwritten != sz) {
-        if (io61_writec(f, buf[nwritten]) == -1) {
-            break;
+    if (sz == 0) {
+        return 0;
+    }
+
+    // Check invariants
+    assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
+    assert(f->end_tag - f->pos_tag <= f->bufsize);
+    assert(f->pos_tag == f->end_tag);
+
+
+    size_t pos = 0;
+    while (pos < sz) {
+        if (f->end_tag == f->tag + f->bufsize) {
+            int r = io61_flush(f);
+            if (r != 0) {
+                break;
+            }
         }
-        ++nwritten;
+
+        // Compute copy_sz
+        size_t bytes_to_copy = f->tag + f->bufsize - f->pos_tag;
+        if(bytes_to_copy > sz - pos){
+            bytes_to_copy = sz - pos;
+        }
+
+        memcpy(&f->cbuf[f->pos_tag - f->tag], buf + pos, bytes_to_copy);
+        f->pos_tag += bytes_to_copy;
+        f->end_tag += bytes_to_copy;
+        pos += bytes_to_copy;
     }
-    if (nwritten != 0 || sz == 0) {
-        return nwritten;
-    } else {
-        return -1;
-    }
+    return pos;
+
 }
 
 
