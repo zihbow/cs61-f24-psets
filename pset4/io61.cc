@@ -13,7 +13,12 @@
 
 struct io61_file {
     int fd = -1;     // file descriptor
-    int mode;        // open mode (O_RDONLY or O_WRONLY)
+    int mode;      // open mode (O_RDONLY or O_WRONLY)
+    off_t tag; 
+    off_t pos_tag;
+    off_t end_tag;
+    static constexpr off_t bufsize = 4096; //cache block size
+    unsigned char cbuf[bufsize]; //cached data
 };
 
 
@@ -27,6 +32,9 @@ io61_file* io61_fdopen(int fd, int mode) {
     io61_file* f = new io61_file;
     f->fd = fd;
     f->mode = mode;
+    f->tag = 0;
+    f->end_tag = 0;
+    f->pos_tag = 0;
     return f;
 }
 
@@ -41,21 +49,41 @@ int io61_close(io61_file* f) {
     return r;
 }
 
+// io61_fill returns -1 on error, otherwise returns non-negative n (n = 0 would imply EOF).
+int io61_fill(io61_file* f) {
+
+    // Check invariants.
+    assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
+    assert(f->end_tag - f->pos_tag <= f->bufsize);
+
+    f->tag = f->pos_tag = f->end_tag;
+    // Read data.
+    ssize_t n = read(f->fd, f->cbuf, f->bufsize);
+    if (n >= 0) {
+        f->end_tag = f->tag + n;
+    }
+    else{
+        return -1;
+    }
+    // Recheck invariants (good practice!).
+    assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
+    assert(f->end_tag - f->pos_tag <= f->bufsize);
+    
+    return n;
+}
 
 // io61_readc(f)
 //    Reads a single (unsigned) byte from `f` and returns it. Returns EOF,
 //    which equals -1, on end of file or error.
 
+
 int io61_readc(io61_file* f) {
-    unsigned char ch;
-    ssize_t nr = read(f->fd, &ch, 1);
-    if (nr == 1) {
+    unsigned char ch; 
+    ssize_t n = io61_read(f, &ch, 1); 
+    if(n == 1){
         return ch;
-    } else if (nr == 0) {
-        errno = 0; // clear `errno` to indicate EOF
-        return -1;
-    } else {
-        assert(nr == -1 && errno > 0);
+    }
+    else{
         return -1;
     }
 }
@@ -73,21 +101,41 @@ int io61_readc(io61_file* f) {
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
     size_t nread = 0;
-    while (nread != sz) {
-        int ch = io61_readc(f);
-        if (ch == EOF) {
-            break;
+    while (nread < sz) {
+        // Check if cache needs refilling
+        if (f->pos_tag >= f->end_tag) {
+            int n = io61_fill(f);
+            if (n == -1) { // if fill fails, figure out if we are at EOF or if another error occurred
+                return -1;
+            }
+            if (n == 0) {
+                break;
+            }
         }
-        buf[nread] = ch;
-        ++nread;
+        assert(f->tag <= f->end_tag);
+        assert(f->pos_tag >= f->tag);
+        //calculate how much we can/need to read from the cache
+
+        size_t bytes_to_copy = f->end_tag - f->pos_tag;
+        if(bytes_to_copy > sz - nread){
+            bytes_to_copy = sz - nread;
+        }
+        // Copy from cache to the output buffer
+
+        memcpy(&buf[nread], &f->cbuf[f->pos_tag - f->tag], bytes_to_copy);
+        // Update position pointer, update the value of nread.
+        f->pos_tag += bytes_to_copy;
+        nread += bytes_to_copy;
     }
+
+    // Return the number of bytes read, which should be sz 
     if (nread != 0 || sz == 0 || errno == 0) {
         return nread;
-    } else {
+    }
+    else {
         return -1;
     }
 }
-
 
 // io61_writec(f)
 //    Write a single character `c` to `f` (converted to unsigned char).
