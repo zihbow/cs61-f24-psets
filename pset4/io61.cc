@@ -83,12 +83,7 @@ int io61_readc(io61_file* f) {
     if(n == 1){
         return ch;
     }
-    else if(n == 0){
-        errno = 0; //EOF 
-        return -1;
-    }
     else{
-        assert(n == -1 && errno > 0);
         return -1;
     }
 }
@@ -99,10 +94,6 @@ int io61_readc(io61_file* f) {
 //    bytes read on success. Returns 0 if end-of-file is encountered before
 //    any bytes are read, and -1 if an error is encountered before any
 //    bytes are read.
-//
-//    Note that the return value might be positive, but less than `sz`,
-//    if end-of-file or error is encountered before all `sz` bytes are read.
-//    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
     size_t nread = 0;
@@ -165,38 +156,26 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    if (sz == 0) {
-        return 0;
-    }
-
-    // Check invariants
-    assert(f->tag <= f->pos_tag && f->pos_tag <= f->end_tag);
-    assert(f->end_tag - f->pos_tag <= f->bufsize);
-    assert(f->pos_tag == f->end_tag);
-
-
-    size_t pos = 0;
-    while (pos < sz) {
-        if (f->end_tag == f->tag + f->bufsize) {
-            int r = io61_flush(f);
-            if (r != 0) {
+    size_t nwritten = 0;
+    while(nwritten < sz){
+        if(f->pos_tag == f->tag + f->bufsize){ //if the current pos_tag is equal to the typical spot for the end_tag, flush
+            int n = io61_flush(f);
+            if (n < 0){
                 break;
             }
         }
-
-        // Compute copy_sz
-        size_t bytes_to_copy = f->tag + f->bufsize - f->pos_tag;
-        if(bytes_to_copy > sz - pos){
-            bytes_to_copy = sz - pos;
+        size_t bytes_to_copy = f->tag + f->bufsize - f->pos_tag; //calculate the number of bytes to copy from our cache to buffer
+        if(bytes_to_copy > sz - nwritten){
+            bytes_to_copy = sz - nwritten;
         }
 
-        memcpy(&f->cbuf[f->pos_tag - f->tag], buf + pos, bytes_to_copy);
-        f->pos_tag += bytes_to_copy;
-        f->end_tag += bytes_to_copy;
-        pos += bytes_to_copy;
-    }
-    return pos;
+        memcpy(&f->cbuf[f->pos_tag - f->tag], buf + nwritten, bytes_to_copy);
 
+        f->pos_tag += bytes_to_copy; //update pos_tag, end_tag
+        f->end_tag += bytes_to_copy;
+        nwritten += bytes_to_copy;
+    }
+    return nwritten;
 }
 
 
@@ -209,9 +188,26 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    drop any data cached for reading.
 
 int io61_flush(io61_file* f) {
-    (void) f;
+    off_t nflushed = 0;
+    while (f->tag + nflushed < f->end_tag) {
+        ssize_t nw = write(f->fd, f->cbuf + nflushed, f->end_tag - f->tag - nflushed);
+        if (nw < 0) {
+        if (errno == EINTR || errno == EAGAIN) {
+                continue;
+            } else {
+                return -1;
+            }
+        } else {
+            nflushed += nw;
+        }
+    }
+
+    assert(f->tag + nflushed== f->end_tag);
+    f->tag = f->end_tag;
+        
     return 0;
 }
+
 
 
 // io61_seek(f, off)
@@ -219,14 +215,36 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
-    off_t r = lseek(f->fd, (off_t) off, SEEK_SET);
-    // Ignore the returned offset unless it’s an error.
-    if (r == -1) {
-        return -1;
-    } else {
-        return 0;
-    }
+	assert(f->mode == O_RDONLY || f->mode == O_WRONLY);
+	if(f->mode == O_RDONLY){
+		if (f->tag <= off && off <= f->end_tag) {
+			f->pos_tag = off;
+			return 0;
+		}
+		off_t cache_tag = (off / f->bufsize) * f->bufsize;
+		off_t r = lseek(f->fd, cache_tag, SEEK_SET);
+		if (r == -1) {
+			return -1;
+		}
+		ssize_t nr = read(f->fd, f->cbuf, f->bufsize);
+		f->tag = cache_tag;
+		f->end_tag = cache_tag + nr;
+		f->pos_tag = off;
+	} else {
+		io61_flush(f);
+		off_t r = lseek(f->fd, off, SEEK_SET);
+		if (r == -1) {
+			return -1;
+		}
+		f->tag = r;
+		f->pos_tag = r;
+		f->end_tag = r;
+	}
+	return 0;
 }
+
+
+
 
 
 // You shouldn't need to change these functions.
