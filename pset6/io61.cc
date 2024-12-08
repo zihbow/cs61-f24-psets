@@ -32,15 +32,12 @@ struct io61_file {
     int mode;        // O_RDONLY, O_WRONLY, or O_RDWR
     bool seekable;   // is this file seekable?
 
-    // Single-slot cache
     static constexpr off_t cbufsz = 8192;
     unsigned char cbuf[cbufsz];
     off_t tag;       // offset of first character in `cbuf`
     off_t pos_tag;   // next offset to read or write (non-positioned mode)
     off_t end_tag;   // offset one past last valid character in `cbuf`
 
-    // Positioned mode
-    bool dirty = false;       // has cache been written?
     std::atomic<bool> dirty = false;
     bool positioned = false;  // is cache in positioned mode?
 
@@ -273,8 +270,6 @@ static int io61_fill(io61_file* f) {
 //    Helper functions for io61_flush.
 
 static int io61_flush_dirty(io61_file* f) {
-    // Called when `f`’s cache is dirty and not positioned.
-    // Uses `write`; assumes that the initial file position equals `f->tag`.
     off_t flush_tag = f->tag;
     while (flush_tag != f->end_tag) {
         ssize_t nw = write(f->fd, &f->cbuf[flush_tag - f->tag],
@@ -291,8 +286,6 @@ static int io61_flush_dirty(io61_file* f) {
 }
 
 static int io61_flush_dirty_positioned(io61_file* f) {
-    // Called when `f`’s cache is dirty and positioned.
-    // Uses `pwrite`; does not change file position.
     off_t flush_tag = f->tag;
     while (flush_tag != f->end_tag) {
         ssize_t nw = pwrite(f->fd, &f->cbuf[flush_tag - f->tag],
@@ -308,7 +301,6 @@ static int io61_flush_dirty_positioned(io61_file* f) {
 }
 
 static int io61_flush_clean(io61_file* f) {
-    // Called when `f`’s cache is clean.
     if (!f->positioned && f->seekable) {
         if (lseek(f->fd, f->pos_tag, SEEK_SET) == -1) {
             return -1;
@@ -403,11 +395,8 @@ static int io61_pfill(io61_file* f, off_t off) {
 //    block: if the lock cannot be acquired, it returns -1 right away.
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    (void) f;
-    assert(off >= 0 && len >= 0);
-    assert(locktype == LOCK_EX || locktype == LOCK_SH);
-    if (len == 0) {
-        return 0;
+    assert(f != nullptr);
+    assert(locktype == LOCK_EX);
 
     std::unique_lock<std::mutex> lock(f->mtx, std::try_to_lock);
     if (!lock.owns_lock()){
@@ -436,12 +425,8 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    error conditions, such as EDEADLK (a deadlock was detected).
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    assert(off >= 0 && len >= 0);
     assert(f != nullptr);
     assert(locktype == LOCK_EX || locktype == LOCK_SH);
-    // The handout code polls using `io61_try_lock`.
-    while (io61_try_lock(f, off, len, locktype) != 0) {
-    }
 
     std::unique_lock<std::mutex> lock(f->mtx);
 
@@ -460,9 +445,6 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    Returns 0 on success and -1 on error.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
-    (void) f;
-    assert(off >= 0 && len >= 0);
-    if (len == 0) {
     assert(f != nullptr);
 
     std::unique_lock<std::mutex> lock(f->mtx);
