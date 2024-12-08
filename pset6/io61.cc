@@ -106,7 +106,7 @@ int io61_close(io61_file* f) {
 static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
-    assert(!f->positioned);
+    std::unique_lock<std::mutex> lk(f->mtx);
     if (f->pos_tag == f->end_tag) {
         io61_fill(f);
         if (f->pos_tag == f->end_tag) {
@@ -130,7 +130,7 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    assert(!f->positioned);
+    std::unique_lock<std::mutex> lk(f->mtx);
     size_t nread = 0;
     while (nread != sz) {
         if (f->pos_tag == f->end_tag) {
@@ -156,7 +156,7 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
-    assert(!f->positioned);
+    std::unique_lock<std::mutex> lk(f->mtx);
     if (f->pos_tag == f->tag + f->cbufsz) {
         int r = io61_flush(f);
         if (r == -1) {
@@ -179,7 +179,7 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    assert(!f->positioned);
+    std::unique_lock<std::mutex> lk(f->mtx);
     size_t nwritten = 0;
     while (nwritten != sz) {
         if (f->end_tag == f->tag + f->cbufsz) {
@@ -215,6 +215,7 @@ static int io61_flush_dirty_positioned(io61_file* f);
 static int io61_flush_clean(io61_file* f);
 
 int io61_flush(io61_file* f) {
+    std::unique_lock<std::mutex> lk(f->mtx);
     if (f->dirty && f->positioned) {
         return io61_flush_dirty_positioned(f);
     } else if (f->dirty) {
@@ -230,6 +231,7 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
+    std::unique_lock<std::mutex> lk(f->mtx);
     int r = io61_flush(f);
     if (r == -1) {
         return -1;
@@ -325,6 +327,7 @@ static int io61_pfill(io61_file* f, off_t off);
 
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
+    std::unique_lock<std::mutex> lk(f->mtx);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
             return -1;
@@ -346,6 +349,7 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
 
 ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
                     off_t off) {
+    std::unique_lock<std::mutex> lk(f->mtx);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
             return -1;
