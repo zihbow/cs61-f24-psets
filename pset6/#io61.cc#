@@ -1,31 +1,19 @@
 #include "io61.hh"
 #include <climits>
 #include <cerrno>
-#include <vector>
 #include <mutex>
-#include <thread>
 #include <shared_mutex>
 #include <condition_variable>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <cassert>
-#include <cstring>
-#include <algorithm>
-#include <iostream>
 
 // io61.cc
 //    YOUR CODE HERE!
+// i am glad that i can just directly use this!
 
-struct LockRange {
-    off_t off;
-    off_t len;
-    std::thread::id owner;
-};
 
 // io61_file
 //    Data structure for io61 file wrappers.
-//
 
 struct io61_file {
     int fd = -1;     // file descriptor
@@ -41,29 +29,9 @@ struct io61_file {
 
     // Positioned mode
     bool dirty = false;       // has cache been written?
-    std::atomic<bool> dirty = false;
     bool positioned = false;  // is cache in positioned mode?
-
-    std::mutex mtx; // mutex for locking 
-    std::condition_variable_any cv; 
-    unsigned locked = 0;
-
-    // vector for locks
-    std::vector<LockRange> locks;
 };
 
-bool no_overlap(off_t off1, off_t len1, off_t off2, off_t len2){
-    return (off1 + len1 <= off2 || off2 + len2 <= off1);
-}
-
-bool some_issue(io61_file* f, off_t off, off_t len){
-    for(auto& region : f->locks){
-        if(!no_overlap(off,len, region.off,region.len) && std::this_thread::get_id() != region.owner){
-                return true;
-        }
-    }
-    return false;
-}
 
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
@@ -258,7 +226,7 @@ static int io61_fill(io61_file* f) {
     ssize_t nr;
     while (true) {
         nr = read(f->fd, f->cbuf, f->cbufsz);
-        if (nr >= 0) {
+	.sh)"~        if (nr >= 0) {
             break;
         } else if (errno != EINTR && errno != EAGAIN) {
             return -1;
@@ -331,7 +299,7 @@ static int io61_flush_clean(io61_file* f) {
 
 static int io61_pfill(io61_file* f, off_t off);
 
-ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
+ssize_t io61_p/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"read(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
@@ -408,20 +376,9 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     assert(locktype == LOCK_EX || locktype == LOCK_SH);
     if (len == 0) {
         return 0;
-
-    std::unique_lock<std::mutex> lock(f->mtx, std::try_to_lock);
-    if (!lock.owns_lock()){
-        return -1;
     }
-
-    if(some_issue(f, off, len)){
-        return -1;
-    }
-
-    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()});
     return 0;
 }
-
 
 
 // io61_lock(f, off, len, locktype)
@@ -437,22 +394,15 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
     assert(off >= 0 && len >= 0);
-    assert(f != nullptr);
     assert(locktype == LOCK_EX || locktype == LOCK_SH);
+    if (len == 0) {
+        return 0;
+    }
     // The handout code polls using `io61_try_lock`.
     while (io61_try_lock(f, off, len, locktype) != 0) {
     }
-
-    std::unique_lock<std::mutex> lock(f->mtx);
-
-    f->cv.wait(lock, [&f, off, len]() {
-        return !some_issue(f, off, len);
-    });
-
-    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()});
     return 0;
 }
-
 
 
 // io61_unlock(f, off, len)
@@ -463,27 +413,10 @@ int io61_unlock(io61_file* f, off_t off, off_t len) {
     (void) f;
     assert(off >= 0 && len >= 0);
     if (len == 0) {
-    assert(f != nullptr);
-
-    std::unique_lock<std::mutex> lock(f->mtx);
-
-    std::thread::id current_owner = std::this_thread::get_id();
-    auto it = std::find_if(f->locks.begin(), f->locks.end(),
-                           [&](const LockRange& lr) {
-                               return lr.off == off && lr.len == len && lr.owner == current_owner;
-                           });
-
-    if(it != f->locks.end()){
-        f->locks.erase(it);
-        f->cv.notify_all();
         return 0;
     }
-    else{
-        return -1;
-    }
+    return 0;
 }
-
-
 
 
 
