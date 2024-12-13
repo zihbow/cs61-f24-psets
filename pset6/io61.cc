@@ -12,12 +12,10 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
-#include <iostream>
-
 // io61.cc
 //    YOUR CODE HERE!
 
-struct LockRange {
+struct LockRange { //struct to keep track of regions + owner ids
     off_t off;
     off_t len;
     std::thread::id owner;
@@ -41,32 +39,37 @@ struct io61_file {
     std::atomic<bool> dirty = false;
     bool positioned = false;  // is cache in positioned mode?
 
-    std::mutex mtx; // mutex for locking 
-    std::condition_variable_any cv; 
-    unsigned locked = 0;
-
-    // vector for locks
-    std::vector<LockRange> locks;
+    std::mutex mtx; //mutex to make sure that multiple threads don't modify shared states at the same time
+    std::condition_variable_any cv; //conditional variable for io61_lock().
+    std::vector<LockRange> locks; //vector that keeps track of all of the different regions
 };
-
-bool no_overlap(off_t off1, off_t len1, off_t off2, off_t len2){
+//helper function that figures out whether or not two regions are overlapping
+//returns true when there's no overlap, and false when there is
+static bool no_overlap(off_t off1, off_t len1, off_t off2, off_t len2) { 
     return (off1 + len1 <= off2 || off2 + len2 <= off1);
 }
 
-bool some_issue(io61_file* f, off_t off, off_t len){
-    for(auto& region : f->locks){
-        if(!no_overlap(off,len, region.off,region.len) && std::this_thread::get_id() != region.owner){
-                return true;
+//helper function that determines whether or not there's an issue with the new lock we are trying to make
+
+static bool some_issue(io61_file* f, off_t off, off_t len) {
+    for (auto& region : f->locks) {
+        if (!no_overlap(off,len, region.off,region.len) && std::this_thread::get_id() != region.owner) {
+            //if we have an overlap with a region locked by a different owner, return true
+            return true; 
         }
     }
+    //after iterating through if there are no errors, return false
     return false;
 }
 
-// io61_fdopen(fd, mode)
-//    Returns a new io61_file for file descriptor `fd`. `mode` is either
-//    O_RDONLY for a read-only file, O_WRONLY for a write-only file,
-//    or O_RDWR for a read/write file.
+// Forward declarations of helper functions that assume the mutex is already held
+static int io61_fill_nolock(io61_file* f);
+static int io61_flush_dirty_nolock(io61_file* f);
+static int io61_flush_dirty_positioned_nolock(io61_file* f);
+static int io61_flush_clean_nolock(io61_file* f);
+static int io61_pfill_nolock(io61_file* f, off_t off);
 
+// io61_fdopen(fd, mode)
 io61_file* io61_fdopen(int fd, int mode) {
     assert(fd >= 0);
     assert((mode & O_APPEND) == 0);
@@ -85,30 +88,41 @@ io61_file* io61_fdopen(int fd, int mode) {
     return f;
 }
 
-
 // io61_close(f)
-//    Closes the io61_file `f` and releases all its resources.
-
 int io61_close(io61_file* f) {
-    io61_flush(f);
+    {
+        std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+        if (f->dirty) {
+            if (f->positioned) {
+                io61_flush_dirty_positioned_nolock(f);
+            } else {
+                io61_flush_dirty_nolock(f);
+            }
+        } else {
+            io61_flush_clean_nolock(f);
+        }
+    }
     int r = close(f->fd);
     delete f;
     return r;
 }
 
-
-// NORMAL READING AND WRITING FUNCTIONS
-
 // io61_readc(f)
-//    Reads a single (unsigned) byte from `f` and returns it. Returns EOF,
-//    which equals -1, on end of file or error.
-
-static int io61_fill(io61_file* f);
-
 int io61_readc(io61_file* f) {
-    std::unique_lock<std::mutex> lk(f->mtx);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (f->positioned) {
+        // Switch out of positioned mode
+        if (f->dirty) {
+            if (io61_flush_dirty_positioned_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_clean_nolock(f) == -1) return -1;
+        }
+        f->positioned = false;
+    }
     if (f->pos_tag == f->end_tag) {
-        io61_fill(f);
+        if (io61_fill_nolock(f) == -1) {
+            return -1;
+        }
         if (f->pos_tag == f->end_tag) {
             return -1;
         }
@@ -118,23 +132,21 @@ int io61_readc(io61_file* f) {
     return ch;
 }
 
-
 // io61_read(f, buf, sz)
-//    Reads up to `sz` bytes from `f` into `buf`. Returns the number of
-//    bytes read on success. Returns 0 if end-of-file is encountered before
-//    any bytes are read, and -1 if an error is encountered before any
-//    bytes are read.
-//
-//    Note that the return value might be positive, but less than `sz`,
-//    if end-of-file or error is encountered before all `sz` bytes are read.
-//    This is called a “short read.”
-
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    std::unique_lock<std::mutex> lk(f->mtx);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (f->positioned) {
+        if (f->dirty) {
+            if (io61_flush_dirty_positioned_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_clean_nolock(f) == -1) return -1;
+        }
+        f->positioned = false;
+    }
     size_t nread = 0;
     while (nread != sz) {
         if (f->pos_tag == f->end_tag) {
-            int r = io61_fill(f);
+            int r = io61_fill_nolock(f);
             if (r == -1 && nread == 0) {
                 return -1;
             } else if (f->pos_tag == f->end_tag) {
@@ -150,17 +162,22 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
     return nread;
 }
 
-
 // io61_writec(f)
-//    Write a single character `c` to `f` (converted to unsigned char).
-//    Returns 0 on success and -1 on error.
-
 int io61_writec(io61_file* f, int c) {
-    std::unique_lock<std::mutex> lk(f->mtx);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (f->positioned) {
+        if (f->dirty) {
+            if (io61_flush_dirty_positioned_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_clean_nolock(f) == -1) return -1;
+        }
+        f->positioned = false;
+    }
     if (f->pos_tag == f->tag + f->cbufsz) {
-        int r = io61_flush(f);
-        if (r == -1) {
-            return -1;
+        if (f->dirty) {
+            if (io61_flush_dirty_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_clean_nolock(f) == -1) return -1;
         }
     }
     f->cbuf[f->pos_tag - f->tag] = c;
@@ -170,24 +187,31 @@ int io61_writec(io61_file* f, int c) {
     return 0;
 }
 
-
 // io61_write(f, buf, sz)
-//    Writes `sz` characters from `buf` to `f`. Returns `sz` on success.
-//    Can write fewer than `sz` characters when there is an error, such as
-//    a drive running out of space. In this case io61_write returns the
-//    number of characters written, or -1 if no characters were written
-//    before the error occurred.
-
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    std::unique_lock<std::mutex> lk(f->mtx);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (f->positioned) {
+        if (f->dirty) {
+            if (io61_flush_dirty_positioned_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_clean_nolock(f) == -1) return -1;
+        }
+        f->positioned = false;
+    }
     size_t nwritten = 0;
     while (nwritten != sz) {
         if (f->end_tag == f->tag + f->cbufsz) {
-            int r = io61_flush(f);
-            if (r == -1 && nwritten == 0) {
-                return -1;
-            } else if (r == -1) {
-                break;
+            if (f->dirty) {
+                int r = io61_flush_dirty_nolock(f);
+                if (r == -1 && nwritten == 0) {
+                    return -1;
+                } else if (r == -1) {
+                    break;
+                }
+            } else {
+                if (io61_flush_clean_nolock(f) == -1 && nwritten == 0) {
+                    return -1;
+                }
             }
         }
         size_t nleft = f->tag + f->cbufsz - f->pos_tag;
@@ -201,38 +225,29 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
     return nwritten;
 }
 
-
 // io61_flush(f)
-//    If `f` was opened for writes, `io61_flush(f)` forces a write of any
-//    cached data written to `f`. Returns 0 on success; returns -1 if an error
-//    is encountered before all cached data was written.
-//
-//    If `f` was opened read-only and is seekable, `io61_flush(f)` drops any
-//    data cached for reading and seeks to the logical file position.
-
-static int io61_flush_dirty(io61_file* f);
-static int io61_flush_dirty_positioned(io61_file* f);
-static int io61_flush_clean(io61_file* f);
-
 int io61_flush(io61_file* f) {
-    std::unique_lock<std::mutex> lk(f->mtx);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
     if (f->dirty && f->positioned) {
-        return io61_flush_dirty_positioned(f);
+        return io61_flush_dirty_positioned_nolock(f);
     } else if (f->dirty) {
-        return io61_flush_dirty(f);
+        return io61_flush_dirty_nolock(f);
     } else {
-        return io61_flush_clean(f);
+        return io61_flush_clean_nolock(f);
     }
 }
 
-
 // io61_seek(f, off)
-//    Changes the file pointer for file `f` to `off` bytes into the file.
-//    Returns 0 on success and -1 on failure.
-
 int io61_seek(io61_file* f, off_t off) {
-    std::unique_lock<std::mutex> lk(f->mtx);
-    int r = io61_flush(f);
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    int r;
+    if (f->dirty && f->positioned) {
+        r = io61_flush_dirty_positioned_nolock(f);
+    } else if (f->dirty) {
+        r = io61_flush_dirty_nolock(f);
+    } else {
+        r = io61_flush_clean_nolock(f);
+    }
     if (r == -1) {
         return -1;
     }
@@ -245,14 +260,78 @@ int io61_seek(io61_file* f, off_t off) {
     return 0;
 }
 
+// io61_pread
+ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz, off_t off) {
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (!f->positioned || off < f->tag || off >= f->end_tag) {
+        if (io61_pfill_nolock(f, off) == -1) {
+            return -1;
+        }
+    }
+    size_t nleft = f->end_tag - off;
+    size_t ncopy = std::min(sz, nleft);
+    memcpy(buf, &f->cbuf[off - f->tag], ncopy);
+    return ncopy;
+}
 
-// Helper functions
+// io61_pwrite
+ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz, off_t off) {
+    std::unique_lock<std::mutex> lk(f->mtx); //locks the function from being accessed by multiple threads
+    if (!f->positioned || off < f->tag || off >= f->end_tag) {
+        if (io61_pfill_nolock(f, off) == -1) {
+            return -1;
+        }
+    }
+    size_t nleft = f->end_tag - off;
+    size_t ncopy = std::min(sz, nleft);
+    memcpy(&f->cbuf[off - f->tag], buf, ncopy);
+    f->dirty = true;
+    return ncopy;
+}
 
-// io61_fill(f)
-//    Fill the cache by reading from the file. Returns 0 on success,
-//    -1 on error. Used only for non-positioned files.
+// io61_try_lock
+int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
+    assert(locktype == LOCK_EX);
+    std::unique_lock<std::mutex> lock(f->mtx, std::try_to_lock);
+    if (!lock.owns_lock()) { //unique lock ensures that we don't block other threads.- if there's an issue and we couldn't lock, return -1.
+        return -1;
+    }
+    if (some_issue(f, off, len)) { //if there's an issue, return -1;
+        return -1;
+    }
+    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()}); //place the locked region in our vector of LockRange objects
+    return 0;
+}
 
-static int io61_fill(io61_file* f) {
+// io61_lock
+int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
+    assert(locktype == LOCK_EX || locktype == LOCK_SH);
+    std::unique_lock<std::mutex> lock(f->mtx);
+    f->cv.wait(lock, [&f, off, len]() { //use the conditional variable to keep trying to lock
+        return !some_issue(f, off, len); //if there's some issue, continue to wait
+    });
+    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()}); //place the locked region in our vector of LockRange objects
+    return 0;
+}
+
+// io61_unlock
+int io61_unlock(io61_file* f, off_t off, off_t len) {
+    std::unique_lock<std::mutex> lock(f->mtx);
+    std::thread::id current_owner = std::this_thread::get_id();
+    //looks through the vector of LockRange objects, if we can find one that matches our criteria, then continue
+    //if no LockRange object exists, it = f->locks.end(), so we will return -1.
+    auto it = std::find_if(f->locks.begin(), f->locks.end(), [&](const LockRange& lr) {return lr.off == off && lr.len == len && lr.owner == current_owner;}); 
+    if(it != f->locks.end()){
+        f->locks.erase(it);
+        f->cv.notify_all();
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
+// Helper functions that assume lock is held
+static int io61_fill_nolock(io61_file* f) {
     assert(f->tag == f->end_tag && f->pos_tag == f->end_tag);
     ssize_t nr;
     while (true) {
@@ -267,11 +346,7 @@ static int io61_fill(io61_file* f) {
     return 0;
 }
 
-
-// io61_flush_*(f)
-//    Helper functions for io61_flush.
-
-static int io61_flush_dirty(io61_file* f) {
+static int io61_flush_dirty_nolock(io61_file* f) {
     off_t flush_tag = f->tag;
     while (flush_tag != f->end_tag) {
         ssize_t nw = write(f->fd, &f->cbuf[flush_tag - f->tag],
@@ -287,7 +362,7 @@ static int io61_flush_dirty(io61_file* f) {
     return 0;
 }
 
-static int io61_flush_dirty_positioned(io61_file* f) {
+static int io61_flush_dirty_positioned_nolock(io61_file* f) {
     off_t flush_tag = f->tag;
     while (flush_tag != f->end_tag) {
         ssize_t nw = pwrite(f->fd, &f->cbuf[flush_tag - f->tag],
@@ -302,7 +377,7 @@ static int io61_flush_dirty_positioned(io61_file* f) {
     return 0;
 }
 
-static int io61_flush_clean(io61_file* f) {
+static int io61_flush_clean_nolock(io61_file* f) {
     if (!f->positioned && f->seekable) {
         if (lseek(f->fd, f->pos_tag, SEEK_SET) == -1) {
             return -1;
@@ -312,65 +387,16 @@ static int io61_flush_clean(io61_file* f) {
     return 0;
 }
 
-
-
-// POSITIONED I/O FUNCTIONS
-
-// io61_pread(f, buf, sz, off)
-//    Read up to `sz` bytes from `f` into `buf`, starting at offset `off`.
-//    Returns the number of characters read or -1 on error.
-//
-//    This function can only be called when `f` was opened in read/write
-//    more (O_RDWR).
-
-static int io61_pfill(io61_file* f, off_t off);
-
-ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
-                   off_t off) {
-    std::unique_lock<std::mutex> lk(f->mtx);
-    if (!f->positioned || off < f->tag || off >= f->end_tag) {
-        if (io61_pfill(f, off) == -1) {
-            return -1;
-        }
-    }
-    size_t nleft = f->end_tag - off;
-    size_t ncopy = std::min(sz, nleft);
-    memcpy(buf, &f->cbuf[off - f->tag], ncopy);
-    return ncopy;
-}
-
-
-// io61_pwrite(f, buf, sz, off)
-//    Write up to `sz` bytes from `buf` into `f`, starting at offset `off`.
-//    Returns the number of characters written or -1 on error.
-//
-//    This function can only be called when `f` was opened in read/write
-//    more (O_RDWR).
-
-ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
-                    off_t off) {
-    std::unique_lock<std::mutex> lk(f->mtx);
-    if (!f->positioned || off < f->tag || off >= f->end_tag) {
-        if (io61_pfill(f, off) == -1) {
-            return -1;
-        }
-    }
-    size_t nleft = f->end_tag - off;
-    size_t ncopy = std::min(sz, nleft);
-    memcpy(&f->cbuf[off - f->tag], buf, ncopy);
-    f->dirty = true;
-    return ncopy;
-}
-
-
-// io61_pfill(f, off)
-//    Fill the single-slot cache with data including offset `off`.
-//    The handout code rounds `off` down to a multiple of 8192.
-
-static int io61_pfill(io61_file* f, off_t off) {
+static int io61_pfill_nolock(io61_file* f, off_t off) {
     assert(f->mode == O_RDWR);
-    if (f->dirty && io61_flush(f) == -1) {
-        return -1;
+    if (f->dirty) {
+        if (f->positioned) {
+            if (io61_flush_dirty_positioned_nolock(f) == -1) return -1;
+        } else {
+            if (io61_flush_dirty_nolock(f) == -1) return -1;
+        }
+    } else {
+        if (io61_flush_clean_nolock(f) == -1) return -1;
     }
 
     off = off - (off % 8192);
@@ -384,103 +410,7 @@ static int io61_pfill(io61_file* f, off_t off) {
     return 0;
 }
 
-
-
-// FILE LOCKING FUNCTIONS
-
-// io61_try_lock(f, off, len, locktype)
-//    Attempts to acquire a lock on offsets `[off, off + len)` in file `f`.
-//    `locktype` must be `LOCK_EX`, which requests an exclusive lock,
-//    or `LOCK_SH`, which requests an shared lock. (The applications we
-//    provide in pset 6 only ever use `LOCK_EX`; `LOCK_SH` support is extra
-//    credit.)
-//
-//    Returns 0 if the lock was acquired and -1 if it was not. Does not
-//    block: if the lock cannot be acquired, it returns -1 right away.
-
-int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    assert(f != nullptr);
-    assert(locktype == LOCK_EX);
-
-    std::unique_lock<std::mutex> lock(f->mtx, std::try_to_lock);
-    if (!lock.owns_lock()){
-        return -1;
-    }
-
-    if(some_issue(f, off, len)){
-        return -1;
-    }
-
-    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()});
-    return 0;
-}
-
-
-
-// io61_lock(f, off, len, locktype)
-//    Acquire a lock on offsets `[off, off + len)` in file `f`.
-//    `locktype` must be `LOCK_EX`, which requests an exclusive lock,
-//    or `LOCK_SH`, which requests an shared lock. (The applications we
-//    provide in pset 6 only ever use `LOCK_EX`; `LOCK_SH` support is extra
-//    credit.)
-//
-//    Returns 0 if the lock was acquired and -1 on error. Blocks until
-//    the lock can be acquired; the -1 return value is reserved for true
-//    error conditions, such as EDEADLK (a deadlock was detected).
-
-int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    assert(f != nullptr);
-    assert(locktype == LOCK_EX || locktype == LOCK_SH);
-
-    std::unique_lock<std::mutex> lock(f->mtx);
-
-    f->cv.wait(lock, [&f, off, len]() {
-        return !some_issue(f, off, len);
-    });
-
-    f->locks.emplace_back(LockRange{off, len, std::this_thread::get_id()});
-    return 0;
-}
-
-
-
-// io61_unlock(f, off, len)
-//    Release the lock on offsets `[off, off + len)` in file `f`.
-//    Returns 0 on success and -1 on error.
-
-int io61_unlock(io61_file* f, off_t off, off_t len) {
-    assert(f != nullptr);
-
-    std::unique_lock<std::mutex> lock(f->mtx);
-
-    std::thread::id current_owner = std::this_thread::get_id();
-    auto it = std::find_if(f->locks.begin(), f->locks.end(),
-                           [&](const LockRange& lr) {
-                               return lr.off == off && lr.len == len && lr.owner == current_owner;
-                           });
-
-    if(it != f->locks.end()){
-        f->locks.erase(it);
-        f->cv.notify_all();
-        return 0;
-    }
-    else{
-        return -1;
-    }
-}
-
-
-
-
-
-// HELPER FUNCTIONS
-// You shouldn't need to change these functions.
-
-// io61_open_check(filename, mode)
-//    Opens the file corresponding to `filename` and returns its io61_file.
-//    If `!filename`, returns either the standard input or the
-//    standard output, depending on `mode`. Exits with an error message if
-//    `filename != nullptr` and the named file cannot be opened.
+// io61_open_check, io61_fileno, io61_filesize unchanged
 
 io61_file* io61_open_check(const char* filename, int mode) {
     int fd;
@@ -498,18 +428,9 @@ io61_file* io61_open_check(const char* filename, int mode) {
     return io61_fdopen(fd, mode & O_ACCMODE);
 }
 
-
-// io61_fileno(f)
-//    Returns the file descriptor associated with `f`.
-
 int io61_fileno(io61_file* f) {
     return f->fd;
 }
-
-
-// io61_filesize(f)
-//    Returns the size of `f` in bytes. Returns -1 if `f` does not have a
-//    well-defined size (for instance, if it is a pipe).
 
 off_t io61_filesize(io61_file* f) {
     struct stat s;
